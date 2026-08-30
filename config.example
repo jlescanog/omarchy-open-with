@@ -1,0 +1,27 @@
+# Browser Picker configuration
+# Copy to:  ~/.config/omarchy-browser-picker/config
+# Every setting is optional.
+
+# Label to preselect in the menu (and to open when bypass_menu = true).
+# Use the exact label the menu shows, e.g. "Chrome — Personal" or "Firefox".
+default = Chrome — Personal
+
+# Skip the menu entirely and always open `default` (hold nothing, click a link
+# and it just opens). Set BROWSER_PICKER_MENU=1 to force the menu when needed.
+bypass_menu = false
+
+# Add a "(private)" / incognito row for every browser.
+show_private = false
+
+# Which menu to use:  auto (native Omarchy menu, fall back to fuzzel) | omarchy | fuzzel
+menu = auto
+
+prompt = Open with:
+
+# Per-domain routing. First match wins. The pattern is a shell glob matched
+# against the URL host (and, as a fallback, the whole URL).
+[rules]
+# *.company.com     = Chrome — Work
+# github.com        = Firefox — dev
+# localhost         = Chromium
+# meet.google.com   = Chrome — Personal

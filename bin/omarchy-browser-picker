@@ -1,0 +1,331 @@
+#!/bin/bash
+# Browser Picker — lets you pick which browser/profile opens a link, copy it,
+# or route it automatically by domain, instead of always using the system
+# default. Registered as the default handler for x-scheme-handler/http(s) and
+# text/html via `browser-picker-ctl install`.
+#
+# Config (all optional):
+#   ${XDG_CONFIG_HOME:-~/.config}/omarchy-browser-picker/config
+#
+#     default      = Chrome — Personal   # label to preselect / bypass to
+#     bypass_menu  = false               # true: open `default` without asking
+#     show_private = false               # add "(private)" rows per browser
+#     menu         = auto                # auto | omarchy | fuzzel
+#     prompt       = Open with:
+#
+#     [rules]                            # first match wins; globbed on host
+#     *.work.example      = Chrome — Work
+#     github.com          = Firefox — dev
+#     localhost           = Chromium
+#
+# Env overrides:
+#   BROWSER_PICKER_MENU=1   force the menu even when bypass_menu/rule would skip it
+#   BROWSER_PICKER_PRINT=1  print the resolved action, run nothing
+
+set -euo pipefail
+
+# --- args -------------------------------------------------------------------
+
+url=""
+print_only="${BROWSER_PICKER_PRINT:-0}"
+force_menu="${BROWSER_PICKER_MENU:-0}"
+
+while (($#)); do
+  case "$1" in
+    --clipboard) url="$( { wl-paste 2>/dev/null || true; } | head -c 8192)" ;;
+    --print) print_only=1 ;;
+    --menu) force_menu=1 ;;
+    -h | --help)
+      sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *) url="$1" ;;
+  esac
+  shift
+done
+
+url="${url#"${url%%[![:space:]]*}"}" # ltrim
+url="${url%"${url##*[![:space:]]}"}" # rtrim
+[[ -n $url ]] || {
+  notify-send "Browser Picker" "No URL given" 2>/dev/null || true
+  exit 1
+}
+
+# A bare path or file:// still needs to reach a browser as a URL.
+case "$url" in
+  /*) url="file://$url" ;;
+esac
+
+host="${url#*://}"
+host="${host%%/*}"
+host="${host%%\?*}"
+host="${host#*@}"
+host="${host%%:*}"
+
+# --- config ---------------------------------------------------------------
+
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-browser-picker/config"
+cfg_default=""
+cfg_bypass="false"
+cfg_private="false"
+cfg_menu="auto"
+cfg_prompt="Open with:"
+declare -a rule_pat=() rule_target=()
+
+if [[ -f $conf ]]; then
+  section=""
+  while IFS= read -r line || [[ -n $line ]]; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z $line ]] && continue
+    if [[ $line == "["*"]" ]]; then
+      section="${line#[}"
+      section="${section%]}"
+      continue
+    fi
+    key="${line%%=*}"
+    val="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    case "$section" in
+      rules)
+        rule_pat+=("$key")
+        rule_target+=("$val")
+        ;;
+      *)
+        case "$key" in
+          default) cfg_default="$val" ;;
+          bypass_menu) cfg_bypass="$val" ;;
+          show_private) cfg_private="$val" ;;
+          menu) cfg_menu="$val" ;;
+          prompt) cfg_prompt="$val" ;;
+        esac
+        ;;
+    esac
+  done <"$conf"
+fi
+
+# --- discover targets ----------------------------------------------------------
+
+declare -A targets       # label -> launch command (no url)
+declare -A targets_priv  # label -> private/incognito launch command
+copy_label="󰆏	Copy link"
+
+add_chromium() {
+  local bin="$1" label="$2" state_dir="$3" glyph="$4"
+  command -v "$bin" >/dev/null 2>&1 || return 0
+  local state="$state_dir/Local State" added=0
+  if [[ -f $state ]] && command -v jq >/dev/null 2>&1; then
+    while IFS=$'\t' read -r dir name; do
+      [[ -z $dir ]] && continue
+      targets["$glyph	$label — $name"]="$bin --profile-directory=\"$dir\""
+      targets_priv["$glyph	$label — $name"]="$bin --incognito"
+      added=1
+    done < <(jq -r '.profile.info_cache | to_entries[] | "\(.key)\t\(.value.name)"' "$state" 2>/dev/null)
+  fi
+  if ((!added)); then
+    targets["$glyph	$label"]="$bin"
+    targets_priv["$glyph	$label"]="$bin --incognito"
+  fi
+}
+
+add_firefox() {
+  local bin="$1" label="$2" ini="$3" glyph="$4"
+  command -v "$bin" >/dev/null 2>&1 || return 0
+  local added=0 name
+  if [[ -f $ini ]]; then
+    while IFS= read -r line; do
+      [[ $line == Name=* ]] || continue
+      name="${line#Name=}"
+      targets["$glyph	$label — $name"]="$bin -P \"$name\""
+      targets_priv["$glyph	$label — $name"]="$bin -P \"$name\" --private-window"
+      added=1
+    done <"$ini"
+  fi
+  if ((!added)); then
+    targets["$glyph	$label"]="$bin"
+    targets_priv["$glyph	$label"]="$bin --private-window"
+  fi
+}
+
+add_chromium google-chrome-stable "Chrome"   "$HOME/.config/google-chrome"        "󰊯"
+add_chromium google-chrome        "Chrome"   "$HOME/.config/google-chrome"        "󰊯"
+add_chromium chromium             "Chromium" "$HOME/.config/chromium"             "󰊯"
+add_chromium brave                "Brave"    "$HOME/.config/BraveSoftware/Brave-Browser" "󰖟"
+add_chromium brave-browser        "Brave"    "$HOME/.config/BraveSoftware/Brave-Browser" "󰖟"
+add_chromium microsoft-edge-stable "Edge"    "$HOME/.config/microsoft-edge"       "󰇩"
+add_chromium vivaldi-stable       "Vivaldi"  "$HOME/.config/vivaldi"              "󰖟"
+add_chromium vivaldi              "Vivaldi"  "$HOME/.config/vivaldi"              "󰖟"
+add_chromium opera                "Opera"    "$HOME/.config/opera"                "󰖟"
+add_chromium thorium-browser      "Thorium"  "$HOME/.config/thorium"              "󰖟"
+
+add_firefox firefox    "Firefox"   "$HOME/.mozilla/firefox/profiles.ini"          "󰈹"
+add_firefox librewolf  "LibreWolf" "$HOME/.librewolf/profiles.ini"                "󰈹"
+add_firefox floorp     "Floorp"    "$HOME/.floorp/profiles.ini"                   "󰈹"
+add_firefox waterfox   "Waterfox"  "$HOME/.waterfox/profiles.ini"                 "󰈹"
+add_firefox zen        "Zen"       "$HOME/.zen/profiles.ini"                       "󰈹"
+add_firefox zen-browser "Zen"      "$HOME/.zen/profiles.ini"                      "󰈹"
+
+if ((${#targets[@]} == 0)); then
+  notify-send "Browser Picker" "No browsers found" 2>/dev/null || true
+  exit 1
+fi
+
+# label as shown to a human (icon glyph stripped)
+plain() { local s="$1"; printf '%s' "${s#*$'\t'}"; }
+
+# --- resolve without a menu (rules / bypass) ----------------------------------
+
+resolve_choice() { # echoes the matching plain label for a config value
+  local want="$1" k lbl
+  [[ -n $want ]] || return 1
+  # exact label match first
+  for k in "${!targets[@]}"; do
+    lbl="$(plain "$k")"
+    [[ $lbl == "$want" ]] && { printf '%s' "$lbl"; return 0; }
+  done
+  # then "Chrome" matching the first "Chrome — <profile>"
+  local -a keys
+  mapfile -t keys < <(printf '%s\n' "${!targets[@]}" | sort -t$'\t' -k2)
+  for k in "${keys[@]}"; do
+    lbl="$(plain "$k")"
+    [[ $lbl == "$want — "* ]] && { printf '%s' "$lbl"; return 0; }
+  done
+  return 1
+}
+
+if [[ $force_menu != 1 ]]; then
+  # domain rules first
+  for ((i = 0; i < ${#rule_pat[@]}; i++)); do
+    pat="${rule_pat[$i]}"
+    # shellcheck disable=SC2053
+    if [[ $host == $pat || $url == $pat ]]; then
+      if chosen_plain="$(resolve_choice "${rule_target[$i]}")"; then
+        skip_menu=1
+      fi
+      break
+    fi
+  done
+  # then bypass-to-default
+  if [[ -z ${skip_menu:-} && $cfg_bypass == true ]]; then
+    if chosen_plain="$(resolve_choice "$cfg_default")"; then
+      skip_menu=1
+    fi
+  fi
+fi
+
+# --- menu -------------------------------------------------------------------
+
+# Pick the menu backend once, up front, so a cancelled menu is never chained
+# into a second one popping up behind it.
+menu_backend() {
+  case "$cfg_menu" in
+    omarchy)
+      [[ "$(timeout 3 omarchy menu ping 2>/dev/null)" == ok ]] && { echo omarchy; return; }
+      ;;
+    fuzzel) ;;
+    *)
+      command -v omarchy >/dev/null 2>&1 &&
+        [[ "$(timeout 3 omarchy menu ping 2>/dev/null)" == ok ]] &&
+        { echo omarchy; return; }
+      ;;
+  esac
+  local bin
+  for bin in fuzzel wofi rofi bemenu dmenu; do
+    command -v "$bin" >/dev/null 2>&1 && { echo "$bin"; return; }
+  done
+  echo none
+}
+
+# Runs the chosen backend. Exit 0 with a choice on stdout, exit 0 with no
+# output when the user cancelled, non-zero only if the backend could not run.
+run_menu() {
+  local backend="$1"; shift
+  case "$backend" in
+    omarchy) omarchy menu select "$cfg_prompt" "$@" 2>/dev/null || true ;;
+    fuzzel) printf '%s\n' "$@" | fuzzel --dmenu --prompt "$cfg_prompt " || true ;;
+    wofi) printf '%s\n' "$@" | wofi --dmenu --prompt "$cfg_prompt" || true ;;
+    rofi) printf '%s\n' "$@" | rofi -dmenu -p "$cfg_prompt" || true ;;
+    bemenu | dmenu) printf '%s\n' "$@" | "$backend" || true ;;
+    *) return 1 ;;
+  esac
+}
+
+if [[ -z ${skip_menu:-} ]]; then
+  # Build the option list: profiles A–Z, private rows (opt-in), then Copy.
+  mapfile -t sorted < <(printf '%s\n' "${!targets[@]}" | sort -t$'\t' -k2)
+  # Float the configured default (exact or "Brand" prefix) to the top.
+  default_key=""
+  if [[ -n $cfg_default ]]; then
+    for k in "${sorted[@]}"; do
+      lbl="$(plain "$k")"
+      [[ $lbl == "$cfg_default" || $lbl == "$cfg_default — "* ]] && { default_key="$k"; break; }
+    done
+  fi
+  menu_opts=()
+  [[ -n $default_key ]] && menu_opts+=("$default_key")
+  for k in "${sorted[@]}"; do
+    [[ $k == "$default_key" ]] && continue
+    menu_opts+=("$k")
+  done
+  if [[ $cfg_private == true ]]; then
+    for k in "${sorted[@]}"; do menu_opts+=("$(plain "$k") (private)"); done
+  fi
+  menu_opts+=("$copy_label")
+
+  backend="$(menu_backend)"
+  if [[ $backend == none ]]; then
+    notify-send "Browser Picker" "No menu program found (install fuzzel)" 2>/dev/null || true
+    exit 1
+  fi
+  choice="$(run_menu "$backend" "${menu_opts[@]}")"
+
+  # Empty = the user cancelled (Esc). Do nothing, and never fall through to a
+  # second menu.
+  [[ -n $choice ]] || exit 0
+  # omarchy-menu-select returns the label without the leading glyph; fuzzel
+  # returns the raw row. Normalise to the plain label.
+  choice="${choice#*$'\t'}"
+  chosen_plain="$choice"
+fi
+
+# --- act -------------------------------------------------------------------
+
+# Copy?
+if [[ ${chosen_plain:-} == "Copy link" ]]; then
+  if [[ $print_only == 1 ]]; then echo "copy: $url"; exit 0; fi
+  printf '%s' "$url" | wl-copy
+  notify-send "Browser Picker" "Link copied to clipboard" 2>/dev/null || true
+  exit 0
+fi
+
+# Private variant?
+launch_map="targets"
+key_plain="${chosen_plain:-}"
+if [[ $key_plain == *" (private)" ]]; then
+  key_plain="${key_plain% (private)}"
+  launch_map="targets_priv"
+fi
+
+# Find the storage key whose plain label matches.
+cmd=""
+declare -n MAP="$launch_map"
+for k in "${!MAP[@]}"; do
+  [[ "$(plain "$k")" == "$key_plain" ]] && { cmd="${MAP[$k]}"; break; }
+done
+[[ -n $cmd ]] || { notify-send "Browser Picker" "Unknown choice: $key_plain" 2>/dev/null || true; exit 1; }
+
+if [[ $print_only == 1 ]]; then
+  echo "launch: $cmd \"$url\""
+  exit 0
+fi
+
+# Detach so the browser outlives this handler process and its cgroup.
+if command -v systemd-run >/dev/null 2>&1; then
+  systemd-run --user --quiet --collect \
+    --unit="browser-picker-$(date +%s%N)" \
+    --property=StandardOutput=null --property=StandardError=null \
+    bash -c "uwsm-app -- $cmd \"\$1\"" -- "$url" 2>/dev/null && exit 0
+fi
+setsid -f bash -c "$cmd \"\$1\"" -- "$url" >/dev/null 2>&1
