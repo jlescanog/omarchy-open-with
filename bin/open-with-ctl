@@ -1,40 +1,44 @@
 #!/bin/bash
-# Register / unregister Browser Picker as the system handler for http(s) links
-# and HTML files. Reversible: the previous default is saved on install and
+# Register / unregister Open With as the system handler for http(s) links and
+# HTML files. Reversible: the previous default is saved on install and
 # restored on uninstall.
 #
-#   browser-picker-ctl install      make Browser Picker the default
-#   browser-picker-ctl uninstall    restore the previous default
-#   browser-picker-ctl status       print current state (exit 0 if installed)
+#   open-with-ctl install      make Open With the default link handler
+#   open-with-ctl uninstall    restore the previous default
+#   open-with-ctl status       print current state (exit 0 if installed)
 
 set -euo pipefail
 
 self="$(readlink -f "$0")"
 plugin_dir="$(dirname "$(dirname "$self")")"
-picker="$plugin_dir/bin/omarchy-browser-picker"
+picker="$plugin_dir/bin/omarchy-open-with"
 
-app_id="io.github.jlescanog.browser-picker"
+app_id="io.github.jlescanog.open-with"
 desktop_name="$app_id.desktop"
 apps_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 desktop_file="$apps_dir/$desktop_name"
-state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-browser-picker"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-open-with"
 prev_file="$state_dir/previous-handler"
 
 mimes=(x-scheme-handler/http x-scheme-handler/https text/html)
 
 write_desktop() {
   mkdir -p "$apps_dir"
+  # A pre-existing symlink here could redirect the write; replace it with a
+  # plain file we own.
+  [[ -L $desktop_file ]] && rm -f "$desktop_file"
   cat >"$desktop_file" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Browser Picker
-Comment=Choose which browser/profile opens this link
+Name=Open With
+Comment=Choose which browser/profile opens this link, or copy it
 Exec=$picker %u
 Terminal=false
 NoDisplay=true
 Categories=Network;WebBrowser;
 MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;
 EOF
+  chmod 644 "$desktop_file"
   command -v update-desktop-database >/dev/null 2>&1 &&
     update-desktop-database "$apps_dir" >/dev/null 2>&1 || true
 }
@@ -44,7 +48,7 @@ current_https() {
 }
 
 # A real browser to fall back to, used when the current handler is another
-# picker (or us) and so is not a sane thing to "restore" on uninstall.
+# link picker (or us) and so is not a sane thing to "restore" on uninstall.
 detect_browser() {
   local d name dirs=("$apps_dir" /usr/local/share/applications /usr/share/applications)
   for name in zen.desktop firefox.desktop google-chrome.desktop chromium.desktop \
@@ -56,24 +60,31 @@ detect_browser() {
   return 1
 }
 
+save_previous() {
+  mkdir -p "$state_dir"
+  # Never follow a symlink at the state path.
+  [[ -L $prev_file ]] && rm -f "$prev_file"
+  local prev
+  prev="$(current_https)"
+  case "$prev" in
+    "" | "$desktop_name" | *open-with* | *browser-picker* | *browser-selector*)
+      prev="$(detect_browser || true)" ;;
+  esac
+  [[ -n $prev ]] && printf '%s\n' "$prev" >"$prev_file"
+}
+
 case "${1:-status}" in
   install)
     [[ -x $picker ]] || chmod +x "$picker" 2>/dev/null || true
     write_desktop
-    mkdir -p "$state_dir"
-    prev="$(current_https)"
-    case "$prev" in
-      "" | "$desktop_name" | omarchy-browser-picker.desktop | *browser-picker*)
-        prev="$(detect_browser || true)" ;;
-    esac
-    [[ -n $prev ]] && printf '%s\n' "$prev" >"$prev_file"
+    save_previous
     for m in "${mimes[@]}"; do xdg-mime default "$desktop_name" "$m"; done
     xdg-settings set default-web-browser "$desktop_name" 2>/dev/null || true
-    echo "Browser Picker is now the default handler for http(s) and HTML."
+    echo "Open With is now the default handler for http(s) and HTML."
     ;;
   uninstall)
     prev=""
-    [[ -f $prev_file ]] && prev="$(<"$prev_file")"
+    [[ -f $prev_file && ! -L $prev_file ]] && read -r prev <"$prev_file" || true
     if [[ -n $prev ]]; then
       for m in "${mimes[@]}"; do xdg-mime default "$prev" "$m" 2>/dev/null || true; done
       xdg-settings set default-web-browser "$prev" 2>/dev/null || true

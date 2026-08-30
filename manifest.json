@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.jlescanog.browser-picker",
-  "name": "Browser Picker",
+  "id": "io.github.jlescanog.open-with",
+  "name": "Open With",
   "version": "1.0.0",
   "author": "Jhair Lescano",
   "license": "MIT",
-  "description": "Choose which browser and profile opens a link, or copy it, from a native Omarchy menu. Registers as the system http/https handler; supports per-domain routing rules and a remembered default.",
+  "description": "When you open a link, a small native menu asks which browser and profile it opens in — or copy it. Only the browsers you have installed show up. No config, nothing to learn.",
   "kinds": [
     "service"
   ],

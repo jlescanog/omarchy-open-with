@@ -1,5 +1,5 @@
 #!/bin/bash
-# Smoke tests — no browser is ever launched (BROWSER_PICKER_PRINT=1).
+# Smoke tests. No browser is launched — every case uses --print.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -9,31 +9,44 @@ check() { # desc, expected-substr, actual
     echo "FAIL - $1"; echo "       want *$2*"; echo "       got  $3"; fail=$((fail + 1)); fi
 }
 
-export BROWSER_PICKER_PRINT=1
-
 jq -e . manifest.json >/dev/null && check "manifest is valid JSON" "" ""
-check "omarchy validate passes" "OK" "$(omarchy plugin validate . >/dev/null 2>&1 && echo OK || echo FAIL)"
+check "omarchy validate passes" "OK" \
+  "$(omarchy plugin validate . >/dev/null 2>&1 && echo OK || echo FAIL)"
 
-conf_dir="$(mktemp -d)"
-mkdir -p "$conf_dir/omarchy-browser-picker"
+# Stub the menu so a choice can be forced.
+stub="$(mktemp -d)"
+cat >"$stub/omarchy" <<'S'
+#!/bin/bash
+[ "$1 $2" = "menu ping" ] && { echo ok; exit 0; }
+[ "$1 $2" = "menu select" ] && { cat "${OW_PICK:?}"; exit 0; }
+exit 1
+S
+chmod +x "$stub/omarchy"
+sel="$(mktemp)"
+run() { OW_PICK="$sel" PATH="$stub:$PATH" bash bin/omarchy-open-with --print "$1" 2>&1; }
 
-# A rule that resolves to an installed browser skips the menu.
-picked="Firefox"; command -v firefox >/dev/null || picked="Chrome"
-printf '[rules]\nexample.com = %s\n' "$picked" >"$conf_dir/omarchy-browser-picker/config"
-out="$(XDG_CONFIG_HOME="$conf_dir" bash bin/omarchy-browser-picker https://example.com/ 2>&1 || true)"
-check "domain rule routes without a menu" "launch:" "$out"
+# Pick the first discovered browser label for the launch tests.
+first="$(bash -c 'source <(sed -n "46,112p" bin/omarchy-open-with)
+  mapfile -t o < <(for i in "${!labels[@]}"; do printf "%s\t%s\n" "${labels[$i]#*$'"'"'\t'"'"'}" "$i"; done | sort | cut -f2)
+  echo "${labels[${o[0]}]#*$'"'"'\t'"'"'}"' 2>/dev/null)"
 
-# bypass_menu opens the default directly.
-printf 'default = %s\nbypass_menu = true\n' "$picked" >"$conf_dir/omarchy-browser-picker/config"
-out="$(XDG_CONFIG_HOME="$conf_dir" bash bin/omarchy-browser-picker https://nowhere.test/ 2>&1 || true)"
-check "bypass_menu opens default directly" "launch:" "$out"
+printf '%s' "$first" >"$sel"
+check "a real choice resolves to a launch" "launch:" "$(run 'https://example.com/')"
 
-# A bare path becomes a file:// URL.
-printf '[rules]\n* = %s\n' "$picked" >"$conf_dir/omarchy-browser-picker/config"
-out="$(XDG_CONFIG_HOME="$conf_dir" bash bin/omarchy-browser-picker /tmp/page.html 2>&1 || true)"
-check "local path is turned into file://" "file:///tmp/page.html" "$out"
+printf 'Copy link' >"$sel"
+check "Copy link resolves to copy" "copy: https://example.com/x" "$(run 'https://example.com/x')"
 
-rm -rf "$conf_dir"
+printf 'Copy link' >"$sel"
+check "a bare path becomes file://" "copy: file:///tmp/p.html" "$(run '/tmp/p.html')"
+
+# A profile name with shell metacharacters must survive as one argv element.
+printf '%s' "$first" >"$sel"
+out="$(run 'https://example.com/;rm -rf ~')"
+# --print shows argv via `printf %q`; a split would put "rm" on its own,
+# unescaped. One argument keeps the ';' and space backslash-escaped together.
+check "url with ; stays one argument" 'example.com/\;rm\ -rf' "$out"
+
+rm -rf "$stub" "$sel"
 echo
 echo "$pass passed, $fail failed"
 [[ $fail -eq 0 ]]

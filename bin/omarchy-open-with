@@ -1,0 +1,192 @@
+#!/bin/bash
+# Open With — when you open a link, pick which browser and which profile it
+# opens in, or copy it. Only the browsers and profiles you actually have show
+# up. No configuration, nothing to learn.
+#
+# Registered as the default handler for http(s) and text/html by
+# `open-with-ctl install`.
+#
+#   omarchy-open-with <url>
+#   omarchy-open-with --clipboard   use the current clipboard contents
+#   omarchy-open-with --print       print the resolved action, run nothing
+
+set -euo pipefail
+
+prompt="Open with:"
+copy_label=$'\tCopy link'
+
+# --- input ----------------------------------------------------------------
+
+url=""
+print_only=0
+while (($#)); do
+  case "$1" in
+    --clipboard) url="$( { wl-paste 2>/dev/null || true; } | head -c 8192)" ;;
+    --print) print_only=1 ;;
+    -h | --help)
+      sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    --) ;;
+    *) url="$1" ;;
+  esac
+  shift
+done
+
+# trim surrounding whitespace / newlines
+url="${url#"${url%%[![:space:]]*}"}"
+url="${url%"${url##*[![:space:]]}"}"
+[[ -n $url ]] || {
+  notify-send "Open With" "No URL given" 2>/dev/null || true
+  exit 1
+}
+# a bare path still has to reach a browser as a URL
+[[ $url == /* ]] && url="file://$url"
+
+# --- discover installed browsers / profiles -----------------------------------
+
+# Parallel arrays: labels[i] is shown in the menu, argv_blob[i] is the command
+# for it as \x1f-separated fields (never eval'd, never word-split).
+labels=()
+argv_blob=()
+
+add_target() { # label, arg...
+  local label="$1"
+  shift
+  labels+=("$label")
+  local blob="" a
+  for a in "$@"; do blob+="$a"$'\x1f'; done
+  argv_blob+=("$blob")
+}
+
+add_chromium() { # bin, brand, config-dir, glyph
+  local bin="$1" brand="$2" dir="$3" glyph="$4"
+  command -v "$bin" >/dev/null 2>&1 || return 0
+  local state="$dir/Local State" got=0
+  if [[ -f $state && ! -L $state ]] && command -v jq >/dev/null 2>&1; then
+    while IFS=$'\t' read -r pdir pname; do
+      [[ -z $pdir ]] && continue
+      add_target "$glyph"$'\t'"$brand — $pname" "$bin" "--profile-directory=$pdir"
+      got=1
+    done < <(jq -r '.profile.info_cache | to_entries[] | "\(.key)\t\(.value.name)"' "$state" 2>/dev/null)
+  fi
+  ((got)) || add_target "$glyph"$'\t'"$brand" "$bin"
+}
+
+add_firefox() { # bin, brand, profiles.ini, glyph
+  local bin="$1" brand="$2" ini="$3" glyph="$4"
+  command -v "$bin" >/dev/null 2>&1 || return 0
+  local got=0 line name
+  if [[ -f $ini && ! -L $ini ]]; then
+    while IFS= read -r line; do
+      [[ $line == Name=* ]] || continue
+      name="${line#Name=}"
+      add_target "$glyph"$'\t'"$brand — $name" "$bin" "-P" "$name"
+      got=1
+    done <"$ini"
+  fi
+  ((got)) || add_target "$glyph"$'\t'"$brand" "$bin"
+}
+
+GLOBE=$'\U000F059F'; FOX=$'\U000F0239'
+add_chromium google-chrome-stable  "Chrome"    "$HOME/.config/google-chrome"                "$GLOBE"
+add_chromium google-chrome         "Chrome"    "$HOME/.config/google-chrome"                "$GLOBE"
+add_chromium chromium              "Chromium"  "$HOME/.config/chromium"                     "$GLOBE"
+add_chromium brave                 "Brave"     "$HOME/.config/BraveSoftware/Brave-Browser"  "$GLOBE"
+add_chromium brave-browser         "Brave"     "$HOME/.config/BraveSoftware/Brave-Browser"  "$GLOBE"
+add_chromium microsoft-edge-stable "Edge"      "$HOME/.config/microsoft-edge"               "$GLOBE"
+add_chromium vivaldi-stable        "Vivaldi"   "$HOME/.config/vivaldi"                      "$GLOBE"
+add_chromium vivaldi               "Vivaldi"   "$HOME/.config/vivaldi"                      "$GLOBE"
+add_chromium opera                 "Opera"     "$HOME/.config/opera"                        "$GLOBE"
+add_chromium thorium-browser       "Thorium"   "$HOME/.config/thorium"                      "$GLOBE"
+add_firefox  firefox     "Firefox"    "$HOME/.mozilla/firefox/profiles.ini" "$FOX"
+add_firefox  librewolf   "LibreWolf"  "$HOME/.librewolf/profiles.ini"       "$FOX"
+add_firefox  floorp      "Floorp"     "$HOME/.floorp/profiles.ini"          "$FOX"
+add_firefox  waterfox    "Waterfox"   "$HOME/.waterfox/profiles.ini"        "$FOX"
+add_firefox  zen         "Zen"        "$HOME/.zen/profiles.ini"             "$FOX"
+add_firefox  zen-browser "Zen"        "$HOME/.zen/profiles.ini"             "$FOX"
+
+if ((${#labels[@]} == 0)); then
+  notify-send "Open With" "No browsers found" 2>/dev/null || true
+  exit 1
+fi
+
+# stable order: by the text after the glyph
+mapfile -t order < <(
+  for i in "${!labels[@]}"; do printf '%s\t%s\n' "${labels[$i]#*$'\t'}" "$i"; done | sort | cut -f2
+)
+
+# --- menu -------------------------------------------------------------------
+
+menu_opts=()
+for i in "${order[@]}"; do menu_opts+=("${labels[$i]}"); done
+menu_opts+=("$copy_label")
+
+pick_backend() {
+  if command -v omarchy >/dev/null 2>&1 &&
+    [[ "$(timeout 3 omarchy menu ping 2>/dev/null)" == ok ]]; then
+    echo omarchy
+    return
+  fi
+  local b
+  for b in fuzzel wofi rofi bemenu dmenu; do
+    command -v "$b" >/dev/null 2>&1 && { echo "$b"; return; }
+  done
+  echo none
+}
+
+backend="$(pick_backend)"
+case "$backend" in
+  omarchy) choice="$(omarchy menu select "$prompt" "${menu_opts[@]}" 2>/dev/null || true)" ;;
+  fuzzel) choice="$(printf '%s\n' "${menu_opts[@]}" | fuzzel --dmenu --prompt "$prompt " || true)" ;;
+  wofi) choice="$(printf '%s\n' "${menu_opts[@]}" | wofi --dmenu --prompt "$prompt" || true)" ;;
+  rofi) choice="$(printf '%s\n' "${menu_opts[@]}" | rofi -dmenu -p "$prompt" || true)" ;;
+  bemenu | dmenu) choice="$(printf '%s\n' "${menu_opts[@]}" | "$backend" || true)" ;;
+  *)
+    notify-send "Open With" "No menu program found (install fuzzel)" 2>/dev/null || true
+    exit 1
+    ;;
+esac
+
+# empty = cancelled (Esc); do nothing
+[[ -n $choice ]] || exit 0
+# normalise: the omarchy menu drops the leading glyph, fuzzel keeps the row
+choice="${choice#*$'\t'}"
+
+# --- act -------------------------------------------------------------------
+
+if [[ $choice == "Copy link" ]]; then
+  if ((print_only)); then echo "copy: $url"; exit 0; fi
+  printf '%s' "$url" | wl-copy
+  notify-send "Open With" "Link copied" 2>/dev/null || true
+  exit 0
+fi
+
+blob=""
+for i in "${!labels[@]}"; do
+  [[ "${labels[$i]#*$'\t'}" == "$choice" ]] && { blob="${argv_blob[$i]}"; break; }
+done
+[[ -n $blob ]] || {
+  notify-send "Open With" "Unknown choice" 2>/dev/null || true
+  exit 1
+}
+
+mapfile -d $'\x1f' -t argv < <(printf '%s' "${blob%$'\x1f'}")
+argv+=("$url")
+
+if ((print_only)); then
+  printf 'launch:'; printf ' %q' "${argv[@]}"; printf '\n'
+  exit 0
+fi
+
+# Launch detached so the browser outlives this handler. argv is passed as a
+# real argument vector — no shell re-parsing of profile names.
+if command -v systemd-run >/dev/null 2>&1; then
+  pre=()
+  command -v uwsm-app >/dev/null 2>&1 && pre=(uwsm-app --)
+  systemd-run --user --quiet --collect \
+    --unit="open-with-$(date +%s%N)" \
+    --property=StandardOutput=null --property=StandardError=null \
+    -- "${pre[@]}" "${argv[@]}" && exit 0
+fi
+setsid -f "${argv[@]}" >/dev/null 2>&1
