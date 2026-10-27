@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.jlescanog.open-with",
   "name": "Open With",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Jhair Lescano",
   "license": "MIT",
   "description": "When you open a link, a small native menu asks which browser and profile it opens in — or copy it. Only the browsers you have installed show up. No config, nothing to learn.",

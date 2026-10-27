@@ -1,6 +1,6 @@
 #!/bin/bash
-# Register / unregister Open With as the system handler for http(s) links and
-# HTML files. Reversible: the previous default is saved on install and
+# Register / unregister Open With as the system handler for https links and
+# HTML files. Reversible: the previous handlers are saved on install and
 # restored on uninstall.
 #
 #   open-with-ctl install      make Open With the default link handler
@@ -17,10 +17,103 @@ app_id="io.github.jlescanog.open-with"
 desktop_name="$app_id.desktop"
 apps_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 desktop_file="$apps_dir/$desktop_name"
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}"
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-open-with"
 prev_file="$state_dir/previous-handler"
+desktop_backup="$state_dir/desktop-handlers"
 
 mimes=(x-scheme-handler/http x-scheme-handler/https text/html)
+
+# Omarchy keeps a desktop-specific list (~/.config/hyprland-mimeapps.list) that
+# xdg reads before mimeapps.list, routing http(s) through omarchy-browser.desktop.
+# xdg-mime only ever writes mimeapps.list, so the handler has to go here. Only
+# https and text/html are claimed: Omarchy reads the http line to find the real
+# browser (Super+B, web apps), so that one stays untouched.
+desktop_mimes=(x-scheme-handler/https text/html)
+
+# Terminal programs (codex, gh, Python's webbrowser...) open links through
+# $BROWSER, never xdg-mime, and Omarchy points it at its own launcher in
+# interactive bash. A marked block in ~/.bashrc points it at the picker instead.
+bashrc="$HOME/.bashrc"
+block_start="# >>> open-with >>>"
+block_end="# <<< open-with <<<"
+
+desktop_list() {
+  local desktop="${XDG_CURRENT_DESKTOP:-}"
+  [[ -z $desktop && -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] && desktop=Hyprland
+  desktop="${desktop%%:*}"
+  [[ -n $desktop ]] || return 1
+  local list="$config_dir/${desktop,,}-mimeapps.list"
+  [[ -f $list ]] || return 1
+  printf '%s' "$list"
+}
+
+# list_get <list> <mime>: the handler set in [Default Applications], if any.
+list_get() {
+  awk -v key="$2=" '
+    /^\[/ { section = ($0 == "[Default Applications]"); next }
+    section && index($0, key) == 1 { print substr($0, length(key) + 1); exit }
+  ' "$1"
+}
+
+# list_set <list> <mime> <value>: replace or add the key; an empty value
+# removes it. Written through the path so a symlinked dotfile stays a symlink.
+list_set() {
+  local list="$1" tmp
+  tmp="$(mktemp)"
+  awk -v key="$2" -v val="$3" '
+    function emit() { if (!done && val != "") print key "=" val; done = 1 }
+    /^\[/ { if (section) emit(); section = ($0 == "[Default Applications]"); print; next }
+    section && index($0, key "=") == 1 { emit(); next }
+    { print }
+    END {
+      if (section) emit()
+      else if (!done && val != "") { print "[Default Applications]"; print key "=" val }
+    }
+  ' "$list" >"$tmp"
+  cat "$tmp" >"$list"
+  rm -f "$tmp"
+}
+
+# Print the file without our block. Written through the path elsewhere so a
+# symlinked dotfile stays a symlink.
+strip_shell_block() {
+  awk -v start="$block_start" -v end="$block_end" '
+    $0 == start { skip = 1; next }
+    skip && $0 == end { skip = 0; next }
+    !skip { print }
+  ' "$1"
+}
+
+add_shell_block() {
+  [[ -f $bashrc ]] || return 0
+  local tmp
+  tmp="$(mktemp)"
+  # Guarded so a plugin removed without `uninstall` leaves Omarchy's BROWSER.
+  # Placed after Omarchy's rc, which sets BROWSER, or at the end.
+  strip_shell_block "$bashrc" | awk -v start="$block_start" -v end="$block_end" -v picker="$picker" '
+    function block() {
+      print start
+      print "[[ -x \"" picker "\" ]] && export BROWSER=\"" picker "\""
+      print end
+      done = 1
+    }
+    { print }
+    !done && /default\/bash\/rc/ { block() }
+    END { if (!done) block() }
+  ' >"$tmp"
+  cat "$tmp" >"$bashrc"
+  rm -f "$tmp"
+}
+
+remove_shell_block() {
+  [[ -f $bashrc ]] && grep -qxF "$block_start" "$bashrc" || return 0
+  local tmp
+  tmp="$(mktemp)"
+  strip_shell_block "$bashrc" >"$tmp"
+  cat "$tmp" >"$bashrc"
+  rm -f "$tmp"
+}
 
 write_desktop() {
   mkdir -p "$apps_dir"
@@ -47,6 +140,11 @@ current_https() {
   xdg-mime query default x-scheme-handler/https 2>/dev/null || true
 }
 
+# The handler in mimeapps.list alone, ignoring the desktop-specific list.
+base_https() {
+  XDG_CURRENT_DESKTOP= xdg-mime query default x-scheme-handler/https 2>/dev/null || true
+}
+
 # A real browser to fall back to, used when the current handler is another
 # link picker (or us) and so is not a sane thing to "restore" on uninstall.
 detect_browser() {
@@ -65,40 +163,98 @@ save_previous() {
   # Never follow a symlink at the state path.
   [[ -L $prev_file ]] && rm -f "$prev_file"
   local prev
-  prev="$(current_https)"
+  prev="$(base_https)"
   case "$prev" in
-    "" | "$desktop_name" | *open-with* | *browser-picker* | *browser-selector*)
+    "" | "$desktop_name" | omarchy-browser.desktop | *open-with* | *browser-picker* | *browser-selector*)
       prev="$(detect_browser || true)" ;;
   esac
   [[ -n $prev ]] && printf '%s\n' "$prev" >"$prev_file"
+}
+
+# Saved once: a second install must not record our own handler as the previous.
+save_desktop_handlers() {
+  local list="$1" m
+  mkdir -p "$state_dir"
+  [[ -L $desktop_backup ]] && rm -f "$desktop_backup"
+  [[ -f $desktop_backup ]] && return 0
+  for m in "${desktop_mimes[@]}"; do
+    printf '%s\t%s\n' "$m" "$(list_get "$list" "$m")"
+  done >"$desktop_backup"
+}
+
+restore_desktop_handlers() {
+  local list="$1" m prev
+  if [[ -f $desktop_backup && ! -L $desktop_backup ]]; then
+    while IFS=$'\t' read -r m prev; do
+      [[ -n $m ]] && list_set "$list" "$m" "$prev"
+    done <"$desktop_backup"
+  else
+    for m in "${desktop_mimes[@]}"; do
+      [[ "$(list_get "$list" "$m")" == "$desktop_name" ]] && list_set "$list" "$m" ""
+    done
+  fi
+}
+
+# Undo an install made into mimeapps.list (before the desktop-specific list,
+# or on a desktop without one).
+restore_previous() {
+  local prev="" m
+  [[ -f $prev_file && ! -L $prev_file ]] && read -r prev <"$prev_file" || true
+  [[ -n $prev ]] || return 1
+  # Older versions could save omarchy-browser.desktop, which only routes back
+  # to the default browser, so it cannot stand in for one.
+  case "$prev" in
+    "$desktop_name" | omarchy-browser.desktop | *open-with* | *browser-picker* | *browser-selector*)
+      prev="$(detect_browser)" || return 1 ;;
+  esac
+  if [[ "$(base_https)" == "$desktop_name" ]]; then
+    for m in "${mimes[@]}"; do XDG_CURRENT_DESKTOP= xdg-mime default "$prev" "$m" 2>/dev/null || true; done
+    env -u BROWSER XDG_CURRENT_DESKTOP= xdg-settings set default-web-browser "$prev" 2>/dev/null || true
+  fi
+  printf '%s' "$prev"
 }
 
 case "${1:-status}" in
   install)
     [[ -x $picker ]] || chmod +x "$picker" 2>/dev/null || true
     write_desktop
-    save_previous
-    for m in "${mimes[@]}"; do xdg-mime default "$desktop_name" "$m"; done
-    xdg-settings set default-web-browser "$desktop_name" 2>/dev/null || true
-    echo "Open With is now the default handler for http(s) and HTML."
+    if list="$(desktop_list)"; then
+      # An earlier install may have claimed mimeapps.list; hand it back so
+      # Omarchy still finds the real browser there.
+      restore_previous >/dev/null || true
+      rm -f "$prev_file"
+      save_desktop_handlers "$list"
+      for m in "${desktop_mimes[@]}"; do list_set "$list" "$m" "$desktop_name"; done
+    else
+      save_previous
+      for m in "${mimes[@]}"; do xdg-mime default "$desktop_name" "$m"; done
+      xdg-settings set default-web-browser "$desktop_name" 2>/dev/null || true
+    fi
+    add_shell_block
+    echo "Open With is now the default handler for links and HTML."
+    [[ -f $bashrc ]] && echo "Terminal programs use it too in new bash sessions (\$BROWSER in ~/.bashrc)."
     ;;
   uninstall)
-    prev=""
-    [[ -f $prev_file && ! -L $prev_file ]] && read -r prev <"$prev_file" || true
-    if [[ -n $prev ]]; then
-      for m in "${mimes[@]}"; do xdg-mime default "$prev" "$m" 2>/dev/null || true; done
-      xdg-settings set default-web-browser "$prev" 2>/dev/null || true
+    restored=""
+    if list="$(desktop_list)"; then
+      restore_desktop_handlers "$list"
+      restored="$list"
+    fi
+    if prev="$(restore_previous)"; then
       echo "Restored previous default: $prev"
+    elif [[ -n $restored ]]; then
+      echo "Restored previous handlers in $restored"
     else
       echo "No saved previous handler; leaving xdg defaults untouched." >&2
     fi
-    rm -f "$desktop_file" "$prev_file"
+    remove_shell_block
+    rm -f "$desktop_file" "$prev_file" "$desktop_backup"
     command -v update-desktop-database >/dev/null 2>&1 &&
       update-desktop-database "$apps_dir" >/dev/null 2>&1 || true
     ;;
   status)
     if [[ "$(current_https)" == "$desktop_name" ]]; then
-      [[ ${2:-} == --quiet ]] || echo "installed (handling http, https, text/html)"
+      [[ ${2:-} == --quiet ]] || echo "installed (handling links and HTML)"
       exit 0
     else
       [[ ${2:-} == --quiet ]] || echo "not installed (current https handler: $(current_https || echo none))"
