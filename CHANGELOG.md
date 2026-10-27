@@ -14,7 +14,7 @@ Works with Omarchy 4, where links stopped reaching the menu.
   at the picker; `uninstall` removes it.
 - `status` reports correctly under Omarchy's desktop-specific list.
 - Upgrading from 1.0.0 hands `mimeapps.list` back to a real browser instead of
-  `omarchy-browser.desktop`.
+  `omarchy-browser.desktop`, preferring Chromium, which Omarchy ships.
 - Tests cover install/uninstall against a throwaway XDG tree and `~/.bashrc`.
 
 ## 1.0.0

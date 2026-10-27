@@ -149,7 +149,7 @@ base_https() {
 # link picker (or us) and so is not a sane thing to "restore" on uninstall.
 detect_browser() {
   local d name dirs=("$apps_dir" /usr/local/share/applications /usr/share/applications)
-  for name in zen.desktop firefox.desktop google-chrome.desktop chromium.desktop \
+  for name in chromium.desktop zen.desktop firefox.desktop google-chrome.desktop \
     brave-browser.desktop microsoft-edge.desktop vivaldi-stable.desktop; do
     for d in "${dirs[@]}"; do
       [[ -f "$d/$name" ]] && { printf '%s' "$name"; return 0; }
